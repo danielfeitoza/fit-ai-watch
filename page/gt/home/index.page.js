@@ -1,6 +1,5 @@
 import * as hmUI from "@zos/ui";
 import { getDeviceInfo } from "@zos/device";
-import { set as setAlarm, cancel as cancelAlarm } from "@zos/alarm";
 import {
   pauseDropWristScreenOff,
   pausePalmScreenOff,
@@ -10,20 +9,15 @@ import {
   setPageBrightTime,
   setWakeUpRelaunch,
 } from "@zos/display";
-import { showToast } from "@zos/interaction";
-import { Vibrator } from "@zos/sensor";
 import { BasePage } from "@zeppos/zml/base-page";
 import { log as Logger } from "@zos/utils";
 import {
   STORAGE_KEYS,
   clearActiveProgressState,
   clearLinkedUserContext,
-  clearTodayWorkoutState,
   clearUnlinkedStorage,
-  getActiveSessionSnapshot,
   ls_clear_training_state,
   ls_get,
-  ls_remove,
   ls_set,
   migrateLegacyStorage,
 } from "./storage";
@@ -31,29 +25,24 @@ import {
   UI_STATES,
   WEEKDAY_PT_BR,
   advanceProgress,
-  clearRestState,
+  buildTrainingState,
   formatClock,
   generateUuidV4,
-  getDateStringFromIso,
   getElapsedSeconds,
   getProgressionAction,
-  getRemainingRestSeconds,
   isIsoDateToday,
   getTodayDateString,
-  persistRestState,
-  persistSessionIdentifiers,
-  persistWorkoutPayload,
-  readTrainingState,
-  resetProgressForSession,
   resolveUserId,
-  sortExercises,
 } from "./training-state";
 
 const logger = Logger.getLogger("fit-ai-watch");
 
 const POLL_INTERVAL_MS = 4000;
 const LIVE_TICK_MS = 1000;
+const REQUEST_TIMEOUT_MS = 10000;
 const PAIR_URL = "https://www.fitaiapp.cidadeladocodigo.com.br/parear";
+const VALIDATION_ERROR_MESSAGE =
+  'Nao foi possivel validar suas informacoes agora. Verifique sua conexao e toque em "Tentar novamente".';
 
 const COLORS = {
   backgroundText: 0xffffff,
@@ -154,28 +143,21 @@ function formatDebugValue(value, maxLength = 40) {
   return `${raw.slice(0, maxLength - 3)}...`;
 }
 
-function hasOwn(object, key) {
-  return !!object && Object.prototype.hasOwnProperty.call(object, key);
-}
-
-function buildRestFinishedMessage(actionType) {
-  if (actionType === "next-set") {
-    return "A hora do descanso acabou";
-  }
-
-  if (actionType === "next-exercise") {
-    return "A hora do descanso acabou";
-  }
-
-  return "Treino concluido. Finalize a sessao.";
-}
-
 function isAuthoritativeUnlinked(result, linkedUserId) {
-  return result?.status === 404 || (result?.status === 200 && !linkedUserId);
+  return result?.status === 404 || (result?.status === 200 && linkedUserId === "__UNLINKED__");
 }
 
 function isLinkCheckFailure(result) {
   return Number(result?.status || 0) >= 500 || Number(result?.status || 0) === 0;
+}
+
+function withTimeout(promise, timeoutMs = REQUEST_TIMEOUT_MS) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      setTimeout(() => resolve({ status: 408, data: null, reason: "timeout" }), timeoutMs);
+    }),
+  ]);
 }
 
 Page(
@@ -191,6 +173,10 @@ Page(
       this.userId = "";
       this.qrCodeUrl = "";
       this.lastTodayPayload = null;
+      this.activeSessionPayload = null;
+      this.lastActiveResponse = null;
+      this.lastTodayResponse = null;
+      this.lastFinishDebug = null;
       this.currentScreen = "";
       this.feedbackMessage = "";
       this.pendingRetryAction = null;
@@ -207,12 +193,22 @@ Page(
     async build() {
       this.extendActiveScreenTime();
       this.renderBootScreen();
-      await this.bootstrap();
+      try {
+        await this.bootstrap();
+      } catch (error) {
+        logger.error(`Erro fatal no build: ${error?.message || error}`);
+        this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
+      }
     },
 
     async onResume() {
       this.extendActiveScreenTime();
-      await this.handleResume();
+      try {
+        await this.handleResume();
+      } catch (error) {
+        logger.error(`Erro fatal no resume: ${error?.message || error}`);
+        this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
+      }
     },
 
     onPause() {
@@ -220,41 +216,40 @@ Page(
     },
 
     async bootstrap() {
-      migrateLegacyStorage();
-      this.deviceCode = ls_get(STORAGE_KEYS.DEVICE_CODE, "").trim();
-      this.userId = ls_get(STORAGE_KEYS.USER_ID, "").trim();
+      try {
+        migrateLegacyStorage();
+        this.deviceCode = ls_get(STORAGE_KEYS.DEVICE_CODE, "").trim();
+        this.userId = ls_get(STORAGE_KEYS.USER_ID, "").trim();
 
-      if (!this.deviceCode) {
-        this.resetUnlinkedState();
-        this.renderUnlinked();
-        return;
-      }
+        if (!this.deviceCode) {
+          this.resetUnlinkedState();
+          this.renderUnlinked();
+          return;
+        }
 
-      const linkedUser = await this.fetchLinkedUserByDevice(this.deviceCode);
-      const linkedUserId = this.cacheUserId(linkedUser?.data);
+        const linkedUser = await this.fetchLinkedUserByDevice(this.deviceCode);
+        const linkedUserId = this.cacheUserId(linkedUser?.data);
 
-      if (isAuthoritativeUnlinked(linkedUser, linkedUserId)) {
-        this.resetUnlinkedState();
-        this.renderUnlinked();
-        return;
-      }
+        if (isAuthoritativeUnlinked(linkedUser, linkedUserId)) {
+          this.resetUnlinkedState();
+          this.renderUnlinked();
+          return;
+        }
 
-      if (isLinkCheckFailure(linkedUser)) {
-        this.renderFriendlyError(
-          "Houve um erro ao validar o vinculo do smartwatch. Deseja tentar novamente?",
-          () => this.bootstrap()
-        );
-        return;
-      }
+        if (isLinkCheckFailure(linkedUser)) {
+          this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
+          return;
+        }
 
-      const hydrated = await this.syncLinkedContext({
-        allowCachedFallback: false,
-      });
-      if (!hydrated) {
-        this.renderFriendlyError(
-          "Houve um erro durante a validacao do treino de hoje. Deseja tentar novamente?",
-          () => this.bootstrap()
-        );
+        const hydrated = await this.syncLinkedContext({
+          allowCachedFallback: false,
+        });
+        if (!hydrated) {
+          this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
+        }
+      } catch (error) {
+        logger.error(`Erro no bootstrap: ${error?.message || error}`);
+        this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
       }
     },
 
@@ -280,7 +275,7 @@ Page(
         return this.currentTrainingState;
       }
 
-      this.currentTrainingState = readTrainingState();
+      this.currentTrainingState = buildTrainingState(this.activeSessionPayload || {});
       return this.currentTrainingState;
     },
 
@@ -357,7 +352,7 @@ Page(
       }
 
       if (this.currentScreen === UI_STATES.MAIN) {
-        this.renderMain(this.lastTodayPayload || ls_get(STORAGE_KEYS.TODAY_WORKOUT, {}));
+        this.renderMain(this.lastTodayPayload || {});
       }
     },
 
@@ -376,7 +371,6 @@ Page(
 
     setScreen(screenName) {
       this.currentScreen = screenName;
-      ls_set(STORAGE_KEYS.LAST_UI_STATE, screenName);
     },
 
     cacheUserId(payload) {
@@ -396,6 +390,7 @@ Page(
       this.deviceCode = "";
       this.userId = "";
       this.lastTodayPayload = null;
+      this.activeSessionPayload = null;
       this.feedbackMessage = "";
     },
 
@@ -406,7 +401,7 @@ Page(
 
     closeStorageDebug() {
       if (this.debugBackTo === UI_STATES.MAIN) {
-        this.renderMain(this.lastTodayPayload || ls_get(STORAGE_KEYS.TODAY_WORKOUT, {}));
+        this.renderMain(this.lastTodayPayload || {});
         return;
       }
 
@@ -423,14 +418,29 @@ Page(
       this.renderUnlinked();
     },
 
+    getCurrentFinishDebugPayload() {
+      const workout = this.lastTodayPayload || this.activeSessionPayload || {};
+      const sessionId = this.activeSessionPayload?.sessionId || "";
+      const deviceCode = this.deviceCode || ls_get(STORAGE_KEYS.DEVICE_CODE, "").trim();
+
+      return {
+        sessionId,
+        deviceCode,
+        workoutPlanId: workout?.workoutPlanId || "",
+        workoutDayId: workout?.workoutDayId || "",
+        completedAt: new Date().toISOString(),
+      };
+    },
+
     renderStorageDebugScreen() {
       this.setScreen("debug");
       this.cleanupWidgets();
 
       const training = this.getTrainingState(true);
-      const finishDebug = ls_get(STORAGE_KEYS.LAST_FINISH_DEBUG, {});
-      const lastActiveResponse = ls_get(STORAGE_KEYS.LAST_ACTIVE_RESPONSE, {});
-      const lastTodayResponse = ls_get(STORAGE_KEYS.LAST_TODAY_RESPONSE, {});
+      const finishDebug = this.lastFinishDebug || {};
+      const currentFinishDebug = this.getCurrentFinishDebugPayload();
+      const lastActiveResponse = this.lastActiveResponse || {};
+      const lastTodayResponse = this.lastTodayResponse || {};
       const headerFrame = getSafeLayout(26, 40, 16);
       let currentY = 82;
       const sections = [
@@ -445,35 +455,49 @@ Page(
         {
           title: "Sessao e Progresso",
           entries: [
-            `activeSessionId: ${formatDebugValue(ls_get(STORAGE_KEYS.ACTIVE_SESSION_ID, ""))}`,
-            `activeSessionDate: ${formatDebugValue(ls_get(STORAGE_KEYS.ACTIVE_SESSION_DATE, ""))}`,
-            `startedAt: ${formatDebugValue(ls_get(STORAGE_KEYS.STARTED_AT, ""))}`,
-            `completedAt: ${formatDebugValue(ls_get(STORAGE_KEYS.COMPLETED_AT, ""))}`,
-            `exerciseIndex: ${formatDebugValue(ls_get(STORAGE_KEYS.EXERCISE_INDEX, ""))}`,
-            `setsCount: ${formatDebugValue(ls_get(STORAGE_KEYS.SETS_COUNT, ""))}`,
-            `serieCompleted: ${formatDebugValue(ls_get(STORAGE_KEYS.SERIE_COMPLETED, ""))}`,
-            `restRunning: ${formatDebugValue(ls_get(STORAGE_KEYS.REST_RUNNING, ""))}`,
-            `restTargetAt: ${formatDebugValue(ls_get(STORAGE_KEYS.REST_TARGET_AT, ""))}`,
+            `activeSessionId: ${formatDebugValue(this.activeSessionPayload?.sessionId || "")}`,
+            `startedAt: ${formatDebugValue(this.activeSessionPayload?.startedAt || "")}`,
+            `completedAt: ${formatDebugValue(this.lastTodayPayload?.completedAt || "")}`,
+            `currentExerciseId: ${formatDebugValue(ls_get(STORAGE_KEYS.CURRENT_EXERCISE_ID, ""))}`,
+            `currentSetNumber: ${formatDebugValue(ls_get(STORAGE_KEYS.CURRENT_SET_NUMBER, ""))}`,
             `currentExercise: ${formatDebugValue(training.currentExercise?.name || "")}`,
           ],
         },
         {
           title: "Treino do Dia",
           entries: [
-            `todayWorkoutDayId: ${formatDebugValue(ls_get(STORAGE_KEYS.WORKOUT_DAY_ID, ""))}`,
-            `todayWorkoutName: ${formatDebugValue(ls_get(STORAGE_KEYS.WORKOUT_DAY_NAME, ""))}`,
-            `todayWorkoutPlanId: ${formatDebugValue(ls_get(STORAGE_KEYS.WORKOUT_PLAN_ID, ""))}`,
-            `weekDay: ${formatDebugValue(ls_get(STORAGE_KEYS.WEEK_DAY, ""))}`,
-            `isRest: ${formatDebugValue(ls_get(STORAGE_KEYS.IS_REST, ""))}`,
+            `todayWorkoutDayId: ${formatDebugValue(this.lastTodayPayload?.workoutDayId || "")}`,
+            `todayWorkoutName: ${formatDebugValue(this.lastTodayPayload?.workoutDayName || "")}`,
+            `todayWorkoutPlanId: ${formatDebugValue(this.lastTodayPayload?.workoutPlanId || "")}`,
+            `weekDay: ${formatDebugValue(this.lastTodayPayload?.weekDay || "")}`,
+            `isRest: ${formatDebugValue(this.lastTodayPayload?.isRest || "")}`,
+          ],
+        },
+        {
+          title: "Payload Finish Atual",
+          entries: [
+            `sessionId: ${formatDebugValue(currentFinishDebug.sessionId, 120)}`,
+            `deviceCode: ${formatDebugValue(currentFinishDebug.deviceCode, 120)}`,
+            `workoutPlanId: ${formatDebugValue(currentFinishDebug.workoutPlanId, 120)}`,
+            `workoutDayId: ${formatDebugValue(currentFinishDebug.workoutDayId, 120)}`,
+            `completedAt: ${formatDebugValue(currentFinishDebug.completedAt, 120)}`,
+          ],
+        },
+        {
+          title: "Ultimo Finish Tentado",
+          entries: [
+            `sessionId: ${formatDebugValue(finishDebug.sessionId || "", 120)}`,
+            `deviceCode: ${formatDebugValue(finishDebug.deviceCode || "", 120)}`,
+            `workoutPlanId: ${formatDebugValue(finishDebug.workoutPlanId || "", 120)}`,
+            `workoutDayId: ${formatDebugValue(finishDebug.workoutDayId || "", 120)}`,
+            `completedAt: ${formatDebugValue(finishDebug.completedAt || "", 120)}`,
           ],
         },
         {
           title: "Ultimas Respostas API",
           entries: [
-            `lastActiveStatus: ${formatDebugValue(JSON.stringify(ls_get(STORAGE_KEYS.LAST_ACTIVE_STATUS, {})), 120)}`,
             `lastActiveResponse: ${formatDebugValue(JSON.stringify(lastActiveResponse), 220)}`,
             `lastTodayResponse: ${formatDebugValue(JSON.stringify(lastTodayResponse), 220)}`,
-            `lastFinishDebug: ${formatDebugValue(JSON.stringify(finishDebug), 220)}`,
           ],
         },
       ];
@@ -557,17 +581,34 @@ Page(
 
     renderTopDebugButton(backTo) {
       const frame = getSafeLayout(16, 44, 10);
-      this.pushWidget(hmUI.widget.TEXT, {
-        x: frame.x,
-        y: 16,
-        w: frame.w,
-        h: 44,
-        text: "FIT.AI",
-        color: COLORS.backgroundText,
-        text_size: 52,
-        align_h: hmUI.align.CENTER_H,
-        align_v: hmUI.align.CENTER_V,
-      });
+      try {
+        this.pushWidget(hmUI.widget.BUTTON, {
+          x: frame.x,
+          y: 16,
+          w: frame.w,
+          h: 44,
+          radius: 0,
+          normal_color: 0x000000,
+          press_color: 0x111111,
+          text: "FIT.AI",
+          color: COLORS.backgroundText,
+          text_size: 30,
+          click_func: () => this.openStorageDebug(backTo),
+        });
+      } catch (error) {
+        logger.warn(`Falha ao renderizar botao de debug: ${error?.message || error}`);
+        this.pushWidget(hmUI.widget.TEXT, {
+          x: frame.x,
+          y: 16,
+          w: frame.w,
+          h: 44,
+          text: "FIT.AI",
+          color: COLORS.backgroundText,
+          text_size: 30,
+          align_h: hmUI.align.CENTER_H,
+          align_v: hmUI.align.CENTER_V,
+        });
+      }
 
       return backTo;
     },
@@ -587,9 +628,9 @@ Page(
         w: DEVICE_WIDTH,
         h: BOTTOM_BUTTON_HEIGHT,
         radius: 0,
-        normal_color: this.isProcessing ? COLORS.neutral : color,
-        press_color: this.isProcessing ? COLORS.neutralPressed : pressColor,
-        text: this.isProcessing ? this.processingText : text,
+        normal_color: color,
+        press_color: pressColor,
+        text,
         text_size: 24,
         color: COLORS.backgroundText,
         click_func: () => {
@@ -617,9 +658,9 @@ Page(
       }
 
       this.bottomButtonWidget.setProperty(hmUI.prop.MORE, {
-        text: this.isProcessing ? this.processingText : text,
-        normal_color: this.isProcessing ? COLORS.neutral : color,
-        press_color: this.isProcessing ? COLORS.neutralPressed : pressColor,
+        text,
+        normal_color: color,
+        press_color: pressColor,
       });
     },
 
@@ -720,10 +761,11 @@ Page(
       });
     },
 
-    renderFriendlyError(message, onRetry) {
+    renderFriendlyError(message, onRetry, buttonText = "Recarregar") {
       this.setScreen(UI_STATES.ERROR);
       this.cleanupWidgets();
       this.pendingRetryAction = onRetry;
+      this.renderTopDebugButton(UI_STATES.ERROR);
 
       const titleFrame = getSafeLayout(92, 50, 18);
       const bodyFrame = getSafeLayout(156, 132, 18);
@@ -754,7 +796,7 @@ Page(
       });
 
       this.renderBottomButton({
-        text: "Recarregar",
+        text: buttonText,
         color: COLORS.neutral,
         pressColor: COLORS.neutralPressed,
         onClick: () => {
@@ -881,7 +923,6 @@ Page(
 
     renderExerciseScreen() {
       this.extendActiveScreenTime();
-      this.ensureRestConclusionIfNeeded();
 
       const training = this.getTrainingState(true);
       const currentExercise = training.currentExercise;
@@ -1013,46 +1054,15 @@ Page(
     getExerciseViewModel(training) {
       const currentExercise = training.currentExercise;
       const action = getProgressionAction(training);
-      const isRestFinished = !training.restRunning && !!training.restStartedAt;
-      const isLastSeriesOfLastExercise =
-        action.type === "finish" && training.serieCompleted !== true;
-      const isReadyToFinishWorkout =
-        action.type === "finish" && training.serieCompleted === true;
-
-      let helperMessage = "Concluiu a serie atual? Inicie o descanso.";
+      const helperMessage = "Concluiu a serie atual? Inicie o descanso.";
       let bottomButton = {
-        text: "Iniciar Descanso",
+        text: "Proxima Serie",
         color: COLORS.info,
         pressColor: COLORS.infoPressed,
-        onClick: () => this.onStartRest(),
+        onClick: () => this.onProgressAfterRest(),
       };
 
-      if (training.restRunning) {
-        helperMessage = "Descansando...";
-        bottomButton = {
-          text: "Aguardando...",
-          color: COLORS.neutral,
-          pressColor: COLORS.neutralPressed,
-          onClick: () => {},
-        };
-      } else if (isRestFinished) {
-        helperMessage = buildRestFinishedMessage(action.type);
-        bottomButton = {
-          text: action.label,
-          color: action.type === "finish" ? COLORS.success : COLORS.info,
-          pressColor: action.type === "finish" ? COLORS.successPressed : COLORS.infoPressed,
-          onClick: () => this.onProgressAfterRest(),
-        };
-      } else if (isLastSeriesOfLastExercise) {
-        helperMessage = "Ultima serie em andamento.";
-        bottomButton = {
-          text: "Finalizar Exercicio",
-          color: COLORS.success,
-          pressColor: COLORS.successPressed,
-          onClick: () => this.onCompleteLastSerie(),
-        };
-      } else if (isReadyToFinishWorkout) {
-        helperMessage = "Ultima serie concluida.";
+      if (action.type === "finish") {
         bottomButton = {
           text: "Finalizar Treino",
           color: COLORS.success,
@@ -1106,27 +1116,6 @@ Page(
         return;
       }
 
-      if (training.restRunning) {
-        const remainingRestSeconds = getRemainingRestSeconds(training.restTargetAt);
-        if (remainingRestSeconds <= 0) {
-          this.completeRest();
-          this.renderExerciseScreen();
-          return;
-        }
-        this.exerciseWidgets.timerLabel?.setProperty(hmUI.prop.MORE, {
-          text: "Tempo total de treino efetivo",
-        });
-        const elapsed = formatClock(getElapsedSeconds(training.startedAt));
-        this.exerciseWidgets.timerValue?.setProperty(hmUI.prop.MORE, {
-          text: elapsed,
-        });
-        this.exerciseWidgets.timerValueBold?.setProperty(hmUI.prop.MORE, {
-          text: elapsed,
-        });
-        this.exerciseWidgets.timerValue?.setProperty(hmUI.prop.COLOR, COLORS.primaryBlue);
-        this.exerciseWidgets.timerValueBold?.setProperty(hmUI.prop.COLOR, COLORS.primaryBlue);
-        return;
-      }
       this.exerciseWidgets.timerLabel?.setProperty(hmUI.prop.MORE, {
         text: "Tempo total de treino efetivo",
       });
@@ -1182,18 +1171,20 @@ Page(
 
     async fetchTodayStatus(deviceCode) {
       try {
-        const result = await this.request({
-          method: "watch.getToday",
-          params: {
-            date: getTodayDateString(),
-            deviceCode,
-          },
-        });
-        ls_set(STORAGE_KEYS.LAST_TODAY_RESPONSE, result || {});
+        const result = await withTimeout(
+          this.request({
+            method: "watch.getToday",
+            params: {
+              date: getTodayDateString(),
+              deviceCode,
+            },
+          })
+        );
+        this.lastTodayResponse = result || {};
         return result;
       } catch (error) {
         logger.error(`Erro ao consultar /watch/today: ${error?.message || error}`);
-        ls_set(STORAGE_KEYS.LAST_TODAY_RESPONSE, { status: 500, data: null, reason: "request_error" });
+        this.lastTodayResponse = { status: 500, data: null, reason: "request_error" };
         return { status: 500, data: null };
       }
     },
@@ -1204,10 +1195,12 @@ Page(
       }
 
       try {
-        return await this.request({
-          method: "watch.getUserId",
-          params: { deviceCode },
-        });
+        return await withTimeout(
+          this.request({
+            method: "watch.getUserId",
+            params: { deviceCode },
+          })
+        );
       } catch (error) {
         logger.error(`Erro ao consultar userId do device: ${error?.message || error}`);
         return { status: 500, data: { userId: 0 } };
@@ -1216,211 +1209,99 @@ Page(
 
     async fetchActiveSessionStatus() {
       if (!this.userId) {
-        ls_set(STORAGE_KEYS.LAST_ACTIVE_STATUS, { status: 400, active: false, reason: "missing_user_id" });
         return { status: 400, data: { active: false } };
       }
 
       try {
-        const result = await this.request({
-          method: "watch.getActiveSession",
-          params: {
-            date: getTodayDateString(),
-            userId: this.userId,
-          },
-        });
-        ls_set(STORAGE_KEYS.LAST_ACTIVE_RESPONSE, result || {});
-        ls_set(STORAGE_KEYS.LAST_ACTIVE_STATUS, {
-          status: Number(result?.status || 0),
-          active: result?.data?.active === true,
-        });
+        const result = await withTimeout(
+          this.request({
+            method: "watch.getActiveSession",
+            params: {
+              date: getTodayDateString(),
+              userId: this.userId,
+            },
+          })
+        );
+        this.lastActiveResponse = result || {};
         return result;
       } catch (error) {
         logger.error(`Erro ao consultar sessao ativa: ${error?.message || error}`);
-        ls_set(STORAGE_KEYS.LAST_ACTIVE_RESPONSE, { status: 500, data: { active: false }, reason: "request_error" });
-        ls_set(STORAGE_KEYS.LAST_ACTIVE_STATUS, { status: 500, active: false, reason: "request_error" });
+        this.lastActiveResponse = { status: 500, data: { active: false }, reason: "request_error" };
         return { status: 500, data: { active: false } };
       }
     },
 
     persistActiveSessionPayload(payload) {
-      const mergedPayload = {
-        ...(this.lastTodayPayload || ls_get(STORAGE_KEYS.TODAY_WORKOUT, {})),
+      const sessionId =
+        payload?.sessionId ||
+        payload?.userWorkoutSessionId ||
+        payload?.activeSessionId ||
+        payload?.id ||
+        "";
+      this.activeSessionPayload = {
         ...(payload || {}),
-        isRest: false,
+        sessionId,
       };
-      const today = getTodayDateString();
-
-      persistWorkoutPayload(mergedPayload);
-      this.syncCompletedAtStorageFromPayload(
-        hasOwn(payload || {}, "completedAt") ? payload : mergedPayload
-      );
-      persistSessionIdentifiers({
-        sessionId:
-          payload?.userWorkoutSessionId ||
-          payload?.activeSessionId ||
-          payload?.sessionId ||
-          payload?.id ||
-          payload?.userWorkoutSession?.id ||
-          payload?.userWorkoutSession?.userWorkoutSessionId ||
-          getActiveSessionSnapshot().id,
-        startedAt: payload?.startedAt || ls_get(STORAGE_KEYS.STARTED_AT, ""),
-        activeDate: today,
-      });
-
-      if (ls_get(STORAGE_KEYS.EXERCISE_INDEX, "") === "") {
-        ls_set(STORAGE_KEYS.EXERCISE_INDEX, 0);
-      }
-      if (ls_get(STORAGE_KEYS.SETS_COUNT, "") === "") {
-        ls_set(STORAGE_KEYS.SETS_COUNT, 1);
-      }
-      if (ls_get(STORAGE_KEYS.SERIE_COMPLETED, "") === "") {
-        ls_set(STORAGE_KEYS.SERIE_COMPLETED, false);
-      }
-
-      this.lastTodayPayload = mergedPayload;
-    },
-
-    shouldKeepCachedTraining() {
-      const snapshot = getActiveSessionSnapshot();
-      return snapshot.id && snapshot.date === getTodayDateString();
-    },
-
-    syncCompletedAtStorageFromPayload(payload) {
-      if (!payload || !hasOwn(payload, "completedAt")) {
-        return ls_get(STORAGE_KEYS.COMPLETED_AT, "");
-      }
-
-      const completedAt = payload?.completedAt;
-      if (completedAt && isIsoDateToday(completedAt)) {
-        ls_set(STORAGE_KEYS.COMPLETED_AT, completedAt);
-        return completedAt;
-      }
-
-      ls_remove(STORAGE_KEYS.COMPLETED_AT);
-      return "";
+      this.lastTodayPayload = {
+        ...(payload || {}),
+      };
+      this.invalidateTrainingState();
     },
 
     getCompletedAtForToday(workout) {
-      const payloadCompletedAt = workout?.completedAt;
-      const storedCompletedAt = ls_get(STORAGE_KEYS.COMPLETED_AT, "");
-
-      if (isIsoDateToday(payloadCompletedAt)) {
-        return payloadCompletedAt;
-      }
-
-      if (isIsoDateToday(storedCompletedAt)) {
-        return storedCompletedAt;
-      }
-
-      return "";
+      return isIsoDateToday(workout?.completedAt) ? workout?.completedAt : "";
     },
 
     clearActiveTrainingProgress() {
       clearActiveProgressState();
-    },
-
-    shouldResumeLocalActiveTraining(todayWorkout = {}) {
-      const training = this.getTrainingState(true);
-      const snapshot = getActiveSessionSnapshot();
-      const localWorkoutDayId = training.workout?.workoutDayId || ls_get(STORAGE_KEYS.WORKOUT_DAY_ID, "");
-      const remoteWorkoutDayId = todayWorkout?.workoutDayId || "";
-
-      if (!snapshot.id || snapshot.date !== getTodayDateString()) {
-        return false;
-      }
-
-      if (!training.startedAt || !Array.isArray(training.exercises) || training.exercises.length === 0) {
-        return false;
-      }
-
-      if (this.getCompletedAtForToday(todayWorkout || training.workout)) {
-        return false;
-      }
-
-      if (remoteWorkoutDayId && localWorkoutDayId && remoteWorkoutDayId !== localWorkoutDayId) {
-        return false;
-      }
-
-      return true;
+      this.activeSessionPayload = null;
+      this.invalidateTrainingState();
     },
 
     async syncLinkedContext(options = {}) {
-      const allowCachedFallback = !!options.allowCachedFallback;
-      const today = getTodayDateString();
-      const snapshot = getActiveSessionSnapshot();
-      const storedCompletedAt = ls_get(STORAGE_KEYS.COMPLETED_AT, "");
+      try {
+        const activeStatus = await this.fetchActiveSessionStatus();
+        if (activeStatus?.status === 200 && activeStatus?.data?.active === true) {
+          this.persistActiveSessionPayload(activeStatus.data);
+          this.renderExerciseScreen();
+          return true;
+        }
 
-      if (storedCompletedAt && getDateStringFromIso(storedCompletedAt) !== today) {
-        ls_remove(STORAGE_KEYS.COMPLETED_AT);
-      }
+        if (activeStatus?.status >= 500) {
+          return false;
+        }
 
-      if (snapshot.id && snapshot.date && snapshot.date !== today) {
-        ls_clear_training_state();
-      }
+        const todayStatus = await this.fetchTodayStatus(this.deviceCode);
+        this.cacheUserId(todayStatus?.data);
 
-      const activeStatus = await this.fetchActiveSessionStatus();
-      this.syncCompletedAtStorageFromPayload(activeStatus?.data);
-      if (activeStatus?.status === 200 && activeStatus?.data?.active === true) {
-        this.persistActiveSessionPayload(activeStatus.data);
-        this.renderExerciseScreen();
-        return true;
-      }
+        if (todayStatus?.status === 200) {
+          this.activeSessionPayload = null;
+          this.lastTodayPayload = todayStatus.data;
 
-      if (activeStatus?.status >= 500 && !allowCachedFallback) {
-        return false;
-      }
+          if (this.getCompletedAtForToday(todayStatus.data)) {
+            this.clearActiveTrainingProgress();
+            this.renderMain(todayStatus.data);
+            return true;
+          }
 
-      if (activeStatus?.status >= 500 && allowCachedFallback && this.shouldKeepCachedTraining()) {
-        this.renderExerciseScreen();
-        return true;
-      }
-
-      const todayStatus = await this.fetchTodayStatus(this.deviceCode);
-      this.cacheUserId(todayStatus?.data);
-
-      if (todayStatus?.status === 200) {
-        persistWorkoutPayload(todayStatus.data);
-        this.syncCompletedAtStorageFromPayload(todayStatus?.data);
-        this.lastTodayPayload = todayStatus.data;
-
-        if (this.getCompletedAtForToday(todayStatus.data)) {
           this.clearActiveTrainingProgress();
           this.renderMain(todayStatus.data);
           return true;
         }
 
-        if (this.shouldResumeLocalActiveTraining(todayStatus.data)) {
-          this.renderExerciseScreen();
+        if (todayStatus?.status === 404) {
+          this.activeSessionPayload = null;
+          this.lastTodayPayload = {};
+          this.clearActiveTrainingProgress();
+          this.renderFriendlyError("Nenhum treino encontrado para hoje.", () => this.bootstrap());
           return true;
         }
 
-        this.clearActiveTrainingProgress();
-
-        this.renderMain(todayStatus.data);
-        return true;
+        return false;
+      } catch (error) {
+        logger.error(`Erro no syncLinkedContext: ${error?.message || error}`);
+        return false;
       }
-
-      if (todayStatus?.status === 404) {
-        ls_remove(STORAGE_KEYS.COMPLETED_AT);
-        clearTodayWorkoutState();
-        this.lastTodayPayload = {};
-        this.clearActiveTrainingProgress();
-        this.renderFriendlyError("Nenhum treino encontrado para hoje.", () => this.bootstrap());
-        return true;
-      }
-
-      if (todayStatus?.status >= 500 && allowCachedFallback) {
-        const cachedWorkout = ls_get(STORAGE_KEYS.TODAY_WORKOUT, {});
-        const cachedExercises = sortExercises(ls_get(STORAGE_KEYS.TODAY_EXERCISES, []));
-
-        if (cachedWorkout?.workoutDayId || cachedWorkout?.isRest || cachedExercises.length) {
-          this.lastTodayPayload = cachedWorkout;
-          this.renderMain(cachedWorkout);
-          return true;
-        }
-      }
-
-      return false;
     },
 
     startPolling() {
@@ -1450,9 +1331,14 @@ Page(
           return;
         }
 
+        if (linkedUser?.status === 200 && !linkedUserId) {
+          logger.warn("Vinculo confirmado sem userId resolvido; prosseguindo com hidratacao por deviceCode.");
+        }
+
         const synced = await this.syncLinkedContext({ allowCachedFallback: false });
         if (synced) {
           this.isPairingFlow = false;
+          this.stopPolling();
           return;
         }
 
@@ -1469,78 +1355,8 @@ Page(
       }
     },
 
-    cancelRestAlarm() {
-      const alarmId = Number(ls_get(STORAGE_KEYS.ALARM_ID, 0));
-      if (alarmId > 0) {
-        try {
-          cancelAlarm(alarmId);
-        } catch (error) {
-          logger.warn(`Falha ao cancelar alarme ${alarmId}: ${error?.message || error}`);
-        }
-      }
-
-      ls_remove(STORAGE_KEYS.ALARM_ID);
-    },
-
-    scheduleRestAlarm(targetAtIso) {
-      this.cancelRestAlarm();
-
-      const targetAtMs = new Date(targetAtIso).getTime();
-      if (!targetAtMs || Number.isNaN(targetAtMs)) {
-        return 0;
-      }
-
-      try {
-        return Number(
-          setAlarm({
-            url: "service/timer_bg",
-            time: Math.floor(targetAtMs / 1000),
-            store: true,
-            param: "rest-finished",
-          }) || 0
-        );
-      } catch (error) {
-        logger.warn(`Falha ao agendar alarme do descanso: ${error?.message || error}`);
-        return 0;
-      }
-    },
-
-    ensureRestConclusionIfNeeded() {
-      const training = readTrainingState();
-      if (!training.restRunning) {
-        return;
-      }
-
-      if (getRemainingRestSeconds(training.restTargetAt) <= 0) {
-        this.completeRest();
-      }
-    },
-
-    completeRest() {
-      const training = readTrainingState();
-      if (!training.restRunning) {
-        return;
-      }
-
-      this.cancelRestAlarm();
-      clearRestState();
-      ls_set(STORAGE_KEYS.REST_STARTED_AT, training.restStartedAt);
-
-      try {
-        const vibrator = new Vibrator();
-        vibrator.start();
-      } catch (error) {
-        logger.warn(`Falha ao vibrar: ${error?.message || error}`);
-      }
-
-      const action = getProgressionAction(training);
-      showToast({
-        content: action.type === "next-set" ? "Descanso concluido" : "Hora de avancar",
-      });
-    },
-
     async onStartWorkout() {
-      const workout = this.lastTodayPayload || ls_get(STORAGE_KEYS.TODAY_WORKOUT, {});
+      let workout = this.lastTodayPayload || {};
 
       if (this.getCompletedAtForToday(workout)) {
         this.renderMain(workout);
@@ -1553,8 +1369,22 @@ Page(
 
       const activeStatus = await this.fetchActiveSessionStatus();
       if (activeStatus?.status === 200 && activeStatus?.data?.active === true) {
+        this.hideProcessing();
         this.persistActiveSessionPayload(activeStatus.data);
         this.renderExerciseScreen();
+        return;
+      }
+
+      if (!workout?.workoutDayId) {
+        const todayStatus = await this.fetchTodayStatus(this.deviceCode);
+        if (todayStatus?.status === 200) {
+          workout = todayStatus.data || {};
+          this.lastTodayPayload = workout;
+        }
+      }
+
+      if (!workout?.workoutDayId) {
+        this.renderFriendlyError("Nenhum treino encontrado para hoje.", () => this.bootstrap());
         return;
       }
 
@@ -1569,23 +1399,23 @@ Page(
         });
 
         if (response?.status === 201 && response?.data?.completedAt) {
-          this.syncCompletedAtStorageFromPayload(response.data);
           this.clearActiveTrainingProgress();
-          this.renderMain(workout);
+          this.lastTodayPayload = {
+            ...(workout || {}),
+            completedAt: response.data.completedAt,
+          };
+          this.renderMain(this.lastTodayPayload);
           return;
         }
 
-        if (response?.status === 201 && response?.data?.userWorkoutSessionId) {
-          ls_remove(STORAGE_KEYS.COMPLETED_AT);
-          persistWorkoutPayload(workout);
-          persistSessionIdentifiers({
-            sessionId: response.data.userWorkoutSessionId,
-            startedAt: response.data.startedAt,
-            activeDate: getTodayDateString(),
-          });
-          resetProgressForSession();
-          this.renderExerciseScreen();
-          return;
+        if (response?.status === 201) {
+          const activeAfterStart = await this.fetchActiveSessionStatus();
+          if (activeAfterStart?.status === 200 && activeAfterStart?.data?.active === true) {
+            this.hideProcessing();
+            this.persistActiveSessionPayload(activeAfterStart.data);
+            this.renderExerciseScreen();
+            return;
+          }
         }
 
         this.renderFriendlyError("Falha ao iniciar treino.", () => this.onStartWorkout());
@@ -1595,57 +1425,12 @@ Page(
       }
     },
 
-    onStartRest() {
-      const training = this.getTrainingState(true);
-      const currentExercise = training.currentExercise;
-      const action = getProgressionAction(training);
-
-      if (!currentExercise) {
-        return;
-      }
-
-      if (action.type === "finish") {
-        this.onCompleteLastSerie();
-        return;
-      }
-
-      const restTimeFull = Math.max(0, Number(currentExercise?.restTimeInSeconds || 0));
-      const now = new Date();
-      const restStartedAt = now.toISOString();
-      const restTargetAt = new Date(now.getTime() + restTimeFull * 1000).toISOString();
-      const alarmId = this.scheduleRestAlarm(restTargetAt);
-      ls_set(STORAGE_KEYS.SERIE_COMPLETED, true);
-
-      persistRestState({
-        restTimeFull,
-        restStartedAt,
-        restTargetAt,
-        alarmId,
-      });
-
-      this.invalidateTrainingState();
-      this.renderExerciseScreen();
-    },
-
-    onCompleteLastSerie() {
-      ls_set(STORAGE_KEYS.SERIE_COMPLETED, true);
-      this.invalidateTrainingState();
-      this.renderExerciseScreen();
-    },
-
     onProgressAfterRest() {
       const training = this.getTrainingState(true);
-
-      if (training.restRunning) {
-        return;
-      }
-
-      if (training.restStartedAt) {
-        ls_remove(STORAGE_KEYS.REST_STARTED_AT);
-      }
-
       const action = advanceProgress(training);
       this.invalidateTrainingState();
+      this.hideProcessing();
+      this.currentScreen = "";
 
       if (action.type === "finish") {
         this.renderExerciseScreen();
@@ -1656,8 +1441,8 @@ Page(
     },
 
     async onFinishWorkout() {
-      const sessionId = ls_get(STORAGE_KEYS.ACTIVE_SESSION_ID, "").trim();
-      const workout = ls_get(STORAGE_KEYS.TODAY_WORKOUT, {});
+      const sessionId = this.activeSessionPayload?.sessionId || "";
+      const workout = this.lastTodayPayload || this.activeSessionPayload || {};
 
       if (!this.deviceCode) {
         this.deviceCode = ls_get(STORAGE_KEYS.DEVICE_CODE, "").trim();
@@ -1672,11 +1457,11 @@ Page(
         const finishPayload = {
           sessionId,
           deviceCode: this.deviceCode,
-          workoutPlanId: workout?.workoutPlanId || ls_get(STORAGE_KEYS.WORKOUT_PLAN_ID, ""),
-          workoutDayId: workout?.workoutDayId || ls_get(STORAGE_KEYS.WORKOUT_DAY_ID, ""),
+          workoutPlanId: workout?.workoutPlanId || "",
+          workoutDayId: workout?.workoutDayId || "",
           completedAt: new Date().toISOString(),
         };
-        ls_set(STORAGE_KEYS.LAST_FINISH_DEBUG, finishPayload);
+        this.lastFinishDebug = finishPayload;
 
         const response = await this.request({
           method: "watch.finishSession",
@@ -1690,15 +1475,14 @@ Page(
         });
 
         if (response?.status === 200 || response?.status === 204) {
-          this.cancelRestAlarm();
-          ls_set(STORAGE_KEYS.COMPLETED_AT, finishPayload.completedAt);
           ls_clear_training_state();
           this.feedbackMessage = "Treino finalizado com sucesso";
-          this.lastTodayPayload = {};
-          const synced = await this.syncLinkedContext({ allowCachedFallback: false });
-          if (!synced) {
-            this.renderMain({});
-          }
+          this.activeSessionPayload = null;
+          this.lastTodayPayload = {
+            ...(workout || {}),
+            completedAt: finishPayload.completedAt,
+          };
+          this.renderMain(this.lastTodayPayload);
           return;
         }
 
@@ -1715,40 +1499,18 @@ Page(
       }
 
       if (this.currentScreen === UI_STATES.EXERCISE) {
-        const snapshot = getActiveSessionSnapshot();
-        if (snapshot.date && snapshot.date !== getTodayDateString()) {
-          ls_clear_training_state();
-          this.invalidateTrainingState();
-          await this.syncLinkedContext({ allowCachedFallback: true });
-          return;
+        this.renderBootScreen();
+        const synced = await this.syncLinkedContext({ allowCachedFallback: false });
+        if (!synced) {
+          this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
         }
-
-        this.ensureRestConclusionIfNeeded();
-        this.renderExerciseScreen();
         return;
       }
 
-      if (this.currentScreen === UI_STATES.MAIN) {
-        const cachedWorkout = this.lastTodayPayload || ls_get(STORAGE_KEYS.TODAY_WORKOUT, {});
-        const hasRenderableMainState =
-          !!cachedWorkout?.workoutDayId || cachedWorkout?.isRest === true || !!this.getCompletedAtForToday(cachedWorkout);
-
-        if (hasRenderableMainState) {
-          // Keep resume snappy: render cached state immediately and revalidate in background.
-          this.renderMain(cachedWorkout);
-          setTimeout(() => {
-            if (this.isDestroyed) {
-              return;
-            }
-
-            this.syncLinkedContext({ allowCachedFallback: true }).catch((error) => {
-              logger.warn(`Falha ao revalidar contexto no resume: ${error?.message || error}`);
-            });
-          }, 0);
-          return;
-        }
-
-        await this.syncLinkedContext({ allowCachedFallback: true });
+      this.renderBootScreen();
+      const synced = await this.syncLinkedContext({ allowCachedFallback: false });
+      if (!synced) {
+        this.renderFriendlyError(VALIDATION_ERROR_MESSAGE, () => this.bootstrap(), "Tentar novamente");
       }
     },
 

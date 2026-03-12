@@ -1,4 +1,4 @@
-import { STORAGE_KEYS, ls_get, ls_remove, ls_set } from "./storage";
+import { STORAGE_KEYS, ls_clear_training_state, ls_get, ls_set } from "./storage";
 
 export const UI_STATES = {
   UNLINKED: "unlinked",
@@ -17,10 +17,6 @@ export const WEEKDAY_PT_BR = {
   SATURDAY: "Sabado",
   SUNDAY: "Domingo",
 };
-
-export function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 export function getTodayDateString() {
   const now = new Date();
@@ -108,95 +104,52 @@ export function getElapsedSeconds(startedAt, nowMs = Date.now()) {
   return Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
 }
 
-export function getRemainingRestSeconds(targetAt, nowMs = Date.now()) {
-  const targetAtMs = targetAt ? new Date(targetAt).getTime() : 0;
-  if (!targetAtMs || Number.isNaN(targetAtMs)) {
-    return 0;
+export function resetProgressForSession(exercises = []) {
+  const sorted = sortExercises(exercises);
+  const firstExerciseId = sorted[0]?.id || "";
+
+  if (firstExerciseId) {
+    ls_set(STORAGE_KEYS.CURRENT_EXERCISE_ID, firstExerciseId);
+    ls_set(STORAGE_KEYS.CURRENT_SET_NUMBER, 1);
+    return;
   }
 
-  return Math.max(0, Math.ceil((targetAtMs - nowMs) / 1000));
+  ls_clear_training_state();
 }
 
-export function clearRestState() {
-  ls_remove(STORAGE_KEYS.REST_STARTED_AT);
-  ls_remove(STORAGE_KEYS.REST_TARGET_AT);
-  ls_remove(STORAGE_KEYS.ALARM_ID);
-  ls_set(STORAGE_KEYS.REST_TIME_FULL, 0);
-  ls_set(STORAGE_KEYS.REST_RUNNING, false);
-}
-
-export function persistWorkoutPayload(payload) {
-  const workout = payload || {};
-  const exercises = sortExercises(workout?.exercises || []);
-
-  ls_set(STORAGE_KEYS.TODAY_WORKOUT, workout);
-  ls_set(STORAGE_KEYS.TODAY_EXERCISES, exercises);
-  ls_set(STORAGE_KEYS.WORKOUT_PLAN_ID, workout?.workoutPlanId || "");
-  ls_set(STORAGE_KEYS.WORKOUT_DAY_ID, workout?.workoutDayId || "");
-  ls_set(STORAGE_KEYS.WORKOUT_DAY_NAME, workout?.workoutDayName || "");
-  ls_set(STORAGE_KEYS.WEEK_DAY, workout?.weekDay || "");
-  ls_set(STORAGE_KEYS.IS_REST, workout?.isRest === true);
-}
-
-export function persistSessionIdentifiers({ sessionId, startedAt, activeDate }) {
-  if (sessionId) {
-    ls_set(STORAGE_KEYS.ACTIVE_SESSION_ID, sessionId);
-  }
-
-  if (startedAt) {
-    ls_set(STORAGE_KEYS.STARTED_AT, startedAt);
-  }
-
-  if (activeDate) {
-    ls_set(STORAGE_KEYS.ACTIVE_SESSION_DATE, activeDate);
-  }
-}
-
-export function resetProgressForSession() {
-  ls_set(STORAGE_KEYS.EXERCISE_INDEX, 0);
-  ls_set(STORAGE_KEYS.SETS_COUNT, 1);
-  ls_set(STORAGE_KEYS.SERIE_COMPLETED, false);
-  clearRestState();
-}
-
-export function persistRestState({ restTimeFull, restStartedAt, restTargetAt, alarmId }) {
-  ls_set(STORAGE_KEYS.REST_TIME_FULL, Number(restTimeFull || 0));
-  ls_set(STORAGE_KEYS.REST_STARTED_AT, restStartedAt || "");
-  ls_set(STORAGE_KEYS.REST_TARGET_AT, restTargetAt || "");
-  ls_set(STORAGE_KEYS.REST_RUNNING, true);
-
-  if (alarmId) {
-    ls_set(STORAGE_KEYS.ALARM_ID, Number(alarmId || 0));
-  } else {
-    ls_remove(STORAGE_KEYS.ALARM_ID);
-  }
-}
-
-export function readTrainingState() {
-  const exercises = sortExercises(ls_get(STORAGE_KEYS.TODAY_EXERCISES, []));
-  const rawExerciseIndex = Number(ls_get(STORAGE_KEYS.EXERCISE_INDEX, 0));
-  const maxIndex = Math.max(0, exercises.length - 1);
-  const exerciseIndex = Math.min(Math.max(0, rawExerciseIndex), maxIndex);
-  const currentExercise = exercises[exerciseIndex] || null;
+export function buildTrainingState(sessionPayload = {}) {
+  const exercises = sortExercises(sessionPayload?.exercises || []);
+  const storedExerciseId = ls_get(STORAGE_KEYS.CURRENT_EXERCISE_ID, "").trim();
+  const currentExercise =
+    exercises.find((exercise) => String(exercise?.id || "") === storedExerciseId) || exercises[0] || null;
+  const exerciseIndex = currentExercise
+    ? Math.max(
+        0,
+        exercises.findIndex((exercise) => String(exercise?.id || "") === String(currentExercise?.id || ""))
+      )
+    : 0;
   const totalSets = Math.max(1, Number(currentExercise?.sets || 1));
-  const rawSetsCount = Number(ls_get(STORAGE_KEYS.SETS_COUNT, 1));
-  const setsCount = Math.min(Math.max(1, rawSetsCount), totalSets);
+  const storedSetNumber = Number(ls_get(STORAGE_KEYS.CURRENT_SET_NUMBER, 1));
+  const setNumber = Math.min(Math.max(1, storedSetNumber), totalSets);
+
+  if (currentExercise?.id && String(currentExercise.id) !== storedExerciseId) {
+    ls_set(STORAGE_KEYS.CURRENT_EXERCISE_ID, currentExercise.id);
+  }
+
+  if (!Number.isFinite(storedSetNumber) || storedSetNumber < 1 || storedSetNumber > totalSets) {
+    ls_set(STORAGE_KEYS.CURRENT_SET_NUMBER, setNumber);
+  }
 
   return {
-    workout: ls_get(STORAGE_KEYS.TODAY_WORKOUT, {}),
+    sessionId: sessionPayload?.sessionId || "",
+    startedAt: sessionPayload?.startedAt || "",
+    completedAt: sessionPayload?.completedAt || "",
+    workout: sessionPayload,
     exercises,
     currentExercise,
     exerciseIndex,
-    setsCount,
+    setsCount: setNumber,
     totalSets,
-    serieCompleted: ls_get(STORAGE_KEYS.SERIE_COMPLETED, false),
-    startedAt: ls_get(STORAGE_KEYS.STARTED_AT, ""),
-    restRunning: ls_get(STORAGE_KEYS.REST_RUNNING, false),
-    restTimeFull: Number(ls_get(STORAGE_KEYS.REST_TIME_FULL, 0)),
-    restStartedAt: ls_get(STORAGE_KEYS.REST_STARTED_AT, ""),
-    restTargetAt: ls_get(STORAGE_KEYS.REST_TARGET_AT, ""),
-    sessionId: ls_get(STORAGE_KEYS.ACTIVE_SESSION_ID, ""),
-    sessionDate: ls_get(STORAGE_KEYS.ACTIVE_SESSION_DATE, ""),
   };
 }
 
@@ -213,7 +166,7 @@ export function getProgressionAction(trainingState) {
   }
 
   if (!isLastExercise) {
-    return { type: "next-exercise", label: "Proximo Exercicio" };
+    return { type: "next-exercise", label: "Proxima Serie" };
   }
 
   return { type: "finish", label: "Finalizar Treino" };
@@ -223,15 +176,16 @@ export function advanceProgress(trainingState) {
   const action = getProgressionAction(trainingState);
 
   if (action.type === "next-set") {
-    ls_set(STORAGE_KEYS.SETS_COUNT, trainingState.setsCount + 1);
-    ls_set(STORAGE_KEYS.SERIE_COMPLETED, false);
+    ls_set(STORAGE_KEYS.CURRENT_SET_NUMBER, trainingState.setsCount + 1);
     return action;
   }
 
   if (action.type === "next-exercise") {
-    ls_set(STORAGE_KEYS.EXERCISE_INDEX, trainingState.exerciseIndex + 1);
-    ls_set(STORAGE_KEYS.SETS_COUNT, 1);
-    ls_set(STORAGE_KEYS.SERIE_COMPLETED, false);
+    const nextExercise = trainingState.exercises[trainingState.exerciseIndex + 1] || null;
+    if (nextExercise?.id) {
+      ls_set(STORAGE_KEYS.CURRENT_EXERCISE_ID, nextExercise.id);
+      ls_set(STORAGE_KEYS.CURRENT_SET_NUMBER, 1);
+    }
     return action;
   }
 
